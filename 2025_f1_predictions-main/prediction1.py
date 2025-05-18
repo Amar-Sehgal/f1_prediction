@@ -1,118 +1,108 @@
 import fastf1
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 import os
 
 os.makedirs("f1_cache", exist_ok=True)
-race_name = 'Emilia Romagna GP'
 fastf1.Cache.enable_cache("f1_cache")
 
-# === CONFIGURABLE SECTION ===
-# Specify which years and sessions to use for training
-# Example: {"2024": ["FP1", "FP2", "R"]} qualifying
-years_sessions = {
-    # 2024: ["FP1", "FP2", "Q", "R"]
-    2024: ["FP1", "FP2", "R"]
-}
-# ============================
+# Years to use for training
+train_years = [2022, 2023, 2024]
+test_year = 2025
 
-def get_fp_times(year, session_type):
-    session = fastf1.get_session(year, race_name, session_type)
-    session.load()
-    laps = session.laps
-    # Get best lap per driver
-    best_laps = laps.groupby("Driver")["LapTime"].min().reset_index()
-    best_laps["LapTime (s)"] = best_laps["LapTime"].dt.total_seconds()
-    return best_laps[["Driver", "LapTime (s)"]].rename(
-        columns={"LapTime (s)": f"{session_type}_{year} (s)"}
-    )
+# Get all races for the test year
+schedule = fastf1.get_event_schedule(test_year)
+race_names = schedule["EventName"].tolist()
 
-# Collect all requested data
-all_data = []
-for year, sessions in years_sessions.items():
-    dfs = []
-    for sess in sessions:
-        if sess == "R":
-            session = fastf1.get_session(year, race_name, "R")
-            session.load()
-            laps = session.laps
-            best_laps = laps.groupby("Driver")["LapTime"].min().reset_index()
-            best_laps["LapTime (s)"] = best_laps["LapTime"].dt.total_seconds()
-            dfs.append(
-                best_laps[["Driver", "LapTime (s)"]].rename(
-                    columns={"LapTime (s)": f"Race_{year} (s)"}
-                )
-            )
-        else:
-            dfs.append(get_fp_times(year, sess))
-    # Merge all session data for this year
-    df_merged = dfs[0]
-    for df in dfs[1:]:
-        df_merged = df_merged.merge(df, on="Driver")
-    all_data.append(df_merged)
+correct = 0
+total = 0
 
-# Stack all years' data for training
-if len(all_data) > 1:
-    train_data = pd.concat(all_data, ignore_index=True)
+for race_name in race_names:
+    # --- Gather training data ---
+    session_data = []
+    race_data = []
+    for year in train_years:
+        # Qualifying
+        try:
+            q_sess = fastf1.get_session(year, race_name, "Q")
+            q_sess.load()
+            q_laps = q_sess.laps
+            avg_q = q_laps.groupby("Driver")["LapTime"].mean().reset_index()
+            avg_q["Q (s)"] = avg_q["LapTime"].dt.total_seconds()
+            avg_q = avg_q[["Driver", "Q (s)"]]
+        except Exception:
+            continue  # Skip if session not available
+
+        # Race
+        try:
+            r_sess = fastf1.get_session(year, race_name, "R")
+            r_sess.load()
+            r_laps = r_sess.laps
+            avg_r = r_laps.groupby("Driver")["LapTime"].mean().reset_index()
+            avg_r["Race (s)"] = avg_r["LapTime"].dt.total_seconds()
+            avg_r = avg_r[["Driver", "Race (s)"]]
+        except Exception:
+            continue  # Skip if session not available
+
+        df = avg_q.merge(avg_r, on="Driver")
+        session_data.append(df)
+
+    if not session_data:
+        continue
+
+    train_data = pd.concat(session_data)
+    X = train_data[["Q (s)"]]
+    y = train_data["Race (s)"]
+
+    mask = ~(X.isna().any(axis=1) | y.isna())
+    X = X[mask]
+    y = y[mask]
+
+    if len(X) == 0:
+        continue
+
+    model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=39)
+    model.fit(X, y)
+
+    # --- Predict on 2024 qualifying data ---
+    try:
+        q_2024 = fastf1.get_session(test_year, race_name, "Q")
+        q_2024.load()
+        q_laps_2024 = q_2024.laps
+        avg_q_2024 = q_laps_2024.groupby("Driver")["LapTime"].mean().reset_index()
+        avg_q_2024["Q (s)"] = avg_q_2024["LapTime"].dt.total_seconds()
+        avg_q_2024 = avg_q_2024[["Driver", "Q (s)"]].dropna()
+    except Exception:
+        continue
+
+    X_2024 = avg_q_2024[["Q (s)"]]
+    drivers_2024 = avg_q_2024["Driver"].values
+    preds = model.predict(X_2024)
+    pred_df = pd.DataFrame({"Driver": drivers_2024, "PredictedRaceTime (s)": preds})
+    pred_df = pred_df.sort_values("PredictedRaceTime (s)")
+
+    # --- Get actual 2024 race winner ---
+    try:
+        r_2024 = fastf1.get_session(test_year, race_name, "R")
+        r_2024.load()
+        r_laps_2024 = r_2024.laps
+        avg_r_2024 = r_laps_2024.groupby("Driver")["LapTime"].mean().reset_index()
+        avg_r_2024["Race (s)"] = avg_r_2024["LapTime"].dt.total_seconds()
+        avg_r_2024 = avg_r_2024[["Driver", "Race (s)"]].dropna()
+        winner_actual = avg_r_2024.sort_values("Race (s)").iloc[0]["Driver"]
+    except Exception:
+        continue
+
+    winner_pred = pred_df.iloc[0]["Driver"]
+    total += 1
+    if winner_pred == winner_actual:
+        correct += 1
+
+    print(f"{race_name}: Predicted winner: {winner_pred}, Actual winner: {winner_actual}")
+
+if total > 0:
+    print(f"\nModel correctly picked the winner {correct}/{total} times ({100*correct/total:.1f}%)")
 else:
-    train_data = all_data[0]
-
-# Rename columns for model training (assumes only one year for race, but can be extended)
-rename_dict = {}
-for year, sessions in years_sessions.items():
-    for sess in sessions:
-        if sess == "R":
-            rename_dict[f"Race_{year} (s)"] = "Race (s)"
-        else:
-            rename_dict[f"{sess}_{year} (s)"] = f"{sess} (s)"
-train_data = train_data.rename(columns=rename_dict)
-
-# 2025 FP1 and FP2 times (manually filled)
-qualifying_2025 = pd.DataFrame({
-    "Driver": [
-        "Oscar Piastri", "Lando Norris", "Carlos Sainz", "George Russell", "Lewis Hamilton",
-        "Pierre Gasly", "Max Verstappen", "Alexander Albon", "Gabriel Bortoleto", "Nico Hulkenberg",
-        "Lance Stroll", "Charles Leclerc", "Kimi Antonelli", "Fernando Alonso", "Liam Lawson",
-        "Yuki Tsunoda", "Franco Colapinto", "Oliver Bearman", "Isack Hadjar", "Esteban Ocon"
-    ],
-    "FP1 (s)": [
-        76.545, 76.577, 76.597, 76.599, 76.641,
-        76.696, 76.905, 76.922, 76.925, 76.998,
-        77.032, 77.077, 77.094, 77.121, 77.286,
-        77.356, 77.373, 77.446, 77.641, 77.662
-    ],
-    "FP2 (s)": [
-        75.293, 75.318, 75.934, 75.693, 75.943,
-        75.569, 75.735, 75.916, 76.339, 76.419,
-        76.341, 75.768, 76.406, 76.220, 76.255,
-        75.827, 76.044, 76.009, 75.792, 76.420
-    ],
-    # "Q (s)": [np.nan]*20  # Placeholder until you have qualifying data
-})
-
-# Select features for model based on what is present in train_data and qualifying_2025
-feature_cols = [col for col in train_data.columns if col.endswith("(s)") and col != "Race (s)"]
-X = train_data[feature_cols]
-y = train_data["Race (s)"]
-
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=39)
-model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=39)
-model.fit(X_train, y_train)
-
-# Predict using 2025 data (must match feature_cols)
-X_2025 = qualifying_2025[feature_cols]
-predicted_lap_times = model.predict(X_2025)
-qualifying_2025["PredictedRaceTime (s)"] = predicted_lap_times
-
-# Rank drivers by predicted race time
-qualifying_2025 = qualifying_2025.sort_values(by="PredictedRaceTime (s)")
-
-print(f"\n🏁 Predicted 2025 {race_name} Winner 🏁\n")
-print(qualifying_2025[["Driver", "PredictedRaceTime (s)"]])
-
-# Evaluate Model
-y_pred = model.predict(X_test)
-print(f"\n🔍 Model Error (MAE): {mean_absolute_error(y_test, y_pred):.2f} seconds")
+    print("No races could be evaluated.")
